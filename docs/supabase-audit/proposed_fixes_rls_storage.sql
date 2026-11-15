@@ -1,55 +1,100 @@
+﻿
 -- ============================================================================
--- THE TRAINERS – تدريب — PROPOSED RLS / STORAGE / POLICY TEMPLATES (NOT EXECUTED)
--- Target project: rxkyryaplszuklagvidi
--- Mode: READ-ONLY audit deliverable. Templates only — apply after verifying the
--- current state in the Dashboard (pg_policies, storage.buckets, storage.objects).
+-- THE TRAINERS – تدريب
+-- SAFE RLS / STORAGE AUDIT SCRIPT
+-- Target: rxkyryaplszuklagvidi
+-- READ-ONLY VERIFICATION ONLY – NOT A DEPLOYMENT SCRIPT
 -- ============================================================================
 
--- §1  Enable RLS on every app table (idempotent).
-do $$ declare t text; begin
-  foreach t in array array[
-    'institutions','profiles','classes','students','student_medical_records',
-    'coach_shifts','daily_reports','report_templates','report_exports',
-    'conversations','conversation_members','messages','message_reads',
-    'attendance_records','absence_followups','invitations','otp_codes',
-    'admin_notices','audit_logs','coach_notebooks','notifications','student_notes'
-  ] loop
-    execute format('alter table public.%I enable row level security', t);
-  end loop;
-end $$;
+-- §1. VERIFY RLS STATUS
+-- Read-only: inspect which public tables have RLS enabled.
+-- Do NOT enable RLS automatically before reviewing existing policies.
 
--- §2  Storage buckets (create manually in Dashboard → Storage if missing).
--- Expected buckets: trainer-avatars (private), trainer-media (private), trainer-medical (private).
--- Suggested policies (apply in Dashboard → Storage → Policies, or via SQL after confirming buckets exist):
+SELECT
+    schemaname,
+    tablename,
+    rowsecurity AS rls_enabled
+FROM pg_tables
+WHERE schemaname = 'public'
+ORDER BY tablename;
 
--- trainer-avatars: authenticated users can read avatars within their institution;
---   users can upload/update/delete only their own avatar path.
--- (template; adjust to your actual path convention: {institution_id}/{user_id}/avatar-*)
---
--- create policy "avatars_read_institution" on storage.objects for select to authenticated
---   using (bucket_id = 'trainer-avatars' and (storage.foldername(name))[1] = public.current_institution_id()::text);
--- create policy "avatars_write_own" on storage.objects for insert to authenticated
---   with check (bucket_id = 'trainer-avatars' and (storage.foldername(name))[2] = auth.uid()::text);
--- create policy "avatars_update_own" on storage.objects for update to authenticated
---   using (bucket_id = 'trainer-avatars' and (storage.foldername(name))[2] = auth.uid()::text);
--- create policy "avatars_delete_own" on storage.objects for delete to authenticated
---   using (bucket_id = 'trainer-avatars' and (storage.foldername(name))[2] = auth.uid()::text);
 
--- trainer-media: read by conversation members / institution; write by sender.
--- trainer-medical: read/write by institution admins and the recording coach.
+-- §2. VERIFY EXISTING RLS POLICIES
+-- Read-only.
 
--- §3  RLS policy verification query (run in Dashboard SQL Editor, read-only):
--- select schemaname, tablename, policyname, cmd, qual, with_check
--- from pg_policies where schemaname in ('public','storage') order by schemaname, tablename, policyname;
+SELECT
+    schemaname,
+    tablename,
+    policyname,
+    permissive,
+    roles,
+    cmd,
+    qual,
+    with_check
+FROM pg_policies
+WHERE schemaname IN ('public', 'storage')
+ORDER BY schemaname, tablename, policyname;
 
--- §4  Auth / triggers verification (read-only):
--- select tgname, tgrelid::regclass from pg_trigger where not tgisinternal;
--- select proname from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public';
 
--- §5  Edge Functions: deploy from supabase/functions/ (not a SQL change):
---   supabase functions deploy invite-user verify-otp send-whatsapp send-sms
---   supabase secrets set OTP_DELIVERY_SECRET=... (plus provider credentials)
+-- §3. VERIFY STORAGE BUCKETS
+-- Read-only.
 
--- No policies or buckets were created by this file. All statements above that are
--- uncommented (§1) only enable RLS, which is safe and idempotent. Storage and
--- detailed policies remain commented templates — apply only after review.
+SELECT
+    id,
+    name,
+    public,
+    created_at,
+    updated_at
+FROM storage.buckets
+ORDER BY name;
+
+
+-- §4. VERIFY STORAGE POLICIES
+-- Read-only.
+
+SELECT
+    policyname,
+    permissive,
+    roles,
+    cmd,
+    qual,
+    with_check
+FROM pg_policies
+WHERE schemaname = 'storage'
+  AND tablename = 'objects'
+ORDER BY policyname;
+
+
+-- §5. VERIFY TRIGGERS
+-- Read-only.
+
+SELECT
+    tgname,
+    tgrelid::regclass AS table_name
+FROM pg_trigger
+WHERE NOT tgisinternal
+ORDER BY table_name, tgname;
+
+
+-- §6. VERIFY PUBLIC RPC FUNCTIONS
+-- Read-only: inspect function names and definitions.
+
+SELECT
+    p.proname,
+    pg_get_function_identity_arguments(p.oid) AS arguments,
+    pg_get_functiondef(p.oid) AS definition
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+ORDER BY p.proname;
+
+
+-- ============================================================================
+-- IMPORTANT:
+-- No RLS changes.
+-- No policy creation or deletion.
+-- No Storage bucket creation or modification.
+-- No data changes.
+-- No Edge Function deployment.
+-- Review the actual results before preparing production fixes.
+-- ============================================================================
