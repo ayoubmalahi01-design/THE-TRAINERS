@@ -187,6 +187,13 @@ begin
   if public.current_institution_id() <> p_institution_id then
     raise exception 'Institution not found or not accessible';
   end if;
+  -- profiles.institution_id is ON DELETE RESTRICT. Without this guard the
+  -- DELETE fails with a raw foreign-key error after partially processing other
+  -- cascades. Refuse cleanly instead; member accounts must be transferred by an
+  -- explicitly approved administrative step first.
+  if exists (select 1 from public.profiles where institution_id = p_institution_id) then
+    raise exception 'Institution still has member profiles; transfer or remove them before deletion';
+  end if;
   delete from public.institutions where id = p_institution_id;
   return json_build_object('deleted', true, 'institution_id', p_institution_id);
 end;
@@ -233,3 +240,331 @@ using (
 insert into storage.buckets (id, name, public)
 values ('trainer-report-templates', 'trainer-report-templates', false)
 on conflict (id) do nothing;
+
+-- ============================================================================
+-- SECTION 8 - PER-USER READ RECEIPTS (additive, pending approval)
+-- ----------------------------------------------------------------------------
+-- The live messages.read_at column is global per message: once any member reads
+-- a message it becomes read for everybody. The application already calls
+-- mark_conversation_read() / unread_counts(), so only the server side changes.
+--
+-- This section:
+--   * ensures message_reads has the per-(message, reader) shape;
+--   * replaces both RPCs with membership-checked, per-user implementations;
+--   * does not rewrite or delete existing messages.
+--
+-- Existing global read_at values are intentionally NOT copied into per-user
+-- receipts: doing so would fabricate "read" state for members who never opened
+-- the message. Unread counts may therefore start higher after this change.
+
+create table if not exists public.message_reads (
+  message_id uuid not null references public.messages(id) on delete cascade,
+  reader_id uuid not null references public.profiles(id) on delete cascade,
+  read_at timestamptz not null default now(),
+  primary key (message_id, reader_id)
+);
+
+create index if not exists message_reads_reader_idx
+  on public.message_reads(reader_id, read_at desc);
+
+alter table public.message_reads enable row level security;
+
+drop policy if exists message_reads_read_own on public.message_reads;
+create policy message_reads_read_own on public.message_reads for select to authenticated
+using (reader_id = auth.uid());
+
+drop policy if exists message_reads_insert_own on public.message_reads;
+create policy message_reads_insert_own on public.message_reads for insert to authenticated
+with check (
+  reader_id = auth.uid()
+  and exists (
+    select 1 from public.messages m
+    where m.id = message_id
+      and public.is_conversation_member(m.conversation_id)
+  )
+);
+
+drop policy if exists message_reads_update_own on public.message_reads;
+create policy message_reads_update_own on public.message_reads for update to authenticated
+using (reader_id = auth.uid()) with check (reader_id = auth.uid());
+
+create or replace function public.mark_conversation_read(p_conversation_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if auth.uid() is null then raise exception 'Authentication required'; end if;
+  if not public.is_conversation_member(p_conversation_id) then
+    raise exception 'Not a conversation member';
+  end if;
+  insert into public.message_reads(message_id, reader_id, read_at)
+  select m.id, auth.uid(), now()
+    from public.messages m
+   where m.conversation_id = p_conversation_id
+     and m.sender_id <> auth.uid()
+  on conflict (message_id, reader_id)
+  do update set read_at = excluded.read_at;
+end;
+$$;
+
+create or replace function public.unread_counts()
+returns table (conversation_id uuid, unread bigint)
+language sql
+security definer
+set search_path = public, pg_temp
+as $$
+  select m.conversation_id, count(*)::bigint as unread
+    from public.messages m
+    join public.conversation_members cm
+      on cm.conversation_id = m.conversation_id
+     and cm.profile_id = auth.uid()
+   where m.sender_id <> auth.uid()
+     and not exists (
+       select 1 from public.message_reads r
+        where r.message_id = m.id and r.reader_id = auth.uid()
+     )
+   group by m.conversation_id;
+$$;
+
+revoke all on function public.mark_conversation_read(uuid) from public, anon;
+revoke all on function public.unread_counts() from public, anon;
+grant execute on function public.mark_conversation_read(uuid) to authenticated;
+grant execute on function public.unread_counts() to authenticated;
+
+-- ============================================================================
+-- SECTION 9 - ABSENCE FOLLOW-UP TRIGGER AND HANDLED RPC (pending approval)
+-- ----------------------------------------------------------------------------
+-- The application computes the five-consecutive-absence queue from
+-- attendance_records. This section keeps a server-side record as well, so the
+-- same information survives page reloads and can be audited.
+--
+-- The trigger counts the trailing run of 'absent' rows per student, ordered by
+-- (session_date, session_key). It does not delete or rewrite attendance rows and
+-- does not touch a manual 'done' mark for the same absence run.
+
+create or replace function public.track_absence_followup() returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_streak int := 0;
+  v_first_date date;
+  v_first_key text;
+  r record;
+begin
+  for r in
+    select ar.status, ar.session_date, ar.session_key
+      from public.attendance_records ar
+     where ar.student_id = new.student_id
+     order by ar.session_date desc, ar.session_key desc
+  loop
+    exit when r.status <> 'absent';
+    v_streak := v_streak + 1;
+    v_first_date := r.session_date;
+    v_first_key := r.session_key;
+  end loop;
+
+  if v_streak >= 5 then
+    update public.absence_followups
+       set streak_start = v_first_date,
+           streak_start_key = v_first_key,
+           streak_end = new.session_date,
+           streak_end_key = new.session_key,
+           absences = v_streak,
+           status = case
+             when status = 'done'
+              and streak_end is not distinct from new.session_date
+              and streak_end_key is not distinct from new.session_key
+             then 'done'
+             else 'open'
+           end,
+           updated_at = now()
+     where institution_id = new.institution_id
+       and student_id = new.student_id;
+    if not found then
+      insert into public.absence_followups(
+        institution_id, student_id, streak_start, streak_start_key,
+        streak_end, streak_end_key, absences, status)
+      values (
+        new.institution_id, new.student_id, v_first_date, v_first_key,
+        new.session_date, new.session_key, v_streak, 'open');
+    end if;
+  elsif new.status <> 'absent' then
+    update public.absence_followups
+       set status = 'returned',
+           absences = v_streak,
+           last_follow_up_at = coalesce(last_follow_up_at, now()),
+           updated_at = now()
+     where institution_id = new.institution_id
+       and student_id = new.student_id
+       and status in ('open','done');
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists attendance_followup_trg on public.attendance_records;
+create trigger attendance_followup_trg
+  after insert or update of status on public.attendance_records
+  for each row execute function public.track_absence_followup();
+
+create or replace function public.mark_followup_handled(p_student_id uuid, p_status text default 'done')
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if auth.uid() is null then raise exception 'Authentication required'; end if;
+  if not public.is_institution_admin() then raise exception 'Insufficient permission'; end if;
+  if p_status not in ('open','done','none') then raise exception 'Invalid follow-up status'; end if;
+  update public.absence_followups
+     set status = p_status,
+         last_follow_up_at = now(),
+         updated_at = now()
+   where student_id = p_student_id
+     and institution_id = public.current_institution_id();
+  if not found then raise exception 'Follow-up not found'; end if;
+end;
+$$;
+
+revoke all on function public.mark_followup_handled(uuid, text) from public, anon;
+grant execute on function public.mark_followup_handled(uuid, text) to authenticated;
+
+drop policy if exists absence_followups_admin_update on public.absence_followups;
+create policy absence_followups_admin_update on public.absence_followups for update to authenticated
+using (institution_id = public.current_institution_id() and public.is_institution_admin())
+with check (institution_id = public.current_institution_id() and public.is_institution_admin());
+
+-- ============================================================================
+-- SECTION 10 - STORAGE PATH SCOPING (pending approval)
+-- ----------------------------------------------------------------------------
+-- The baseline policies let any authenticated user read every medical object
+-- and do not bind conversation media to a conversation. These replacements are
+-- institution- and conversation-scoped. Object paths:
+--   trainer-avatars          <institution|platform>/<user>/<file>
+--   trainer-medical          <institution>/<user>/<file>
+--   trainer-media            <institution>/<conversation>/<user>/<file>
+--   trainer-report-templates <institution>/<file>
+
+drop policy if exists trainer_medical_admin_read on storage.objects;
+create policy trainer_medical_admin_read on storage.objects for select to authenticated
+using (
+  bucket_id = 'trainer-medical'
+  and public.is_institution_admin()
+  and (storage.foldername(name))[1] = public.current_institution_id()::text
+);
+
+drop policy if exists trainer_media_read on storage.objects;
+create policy trainer_media_read on storage.objects for select to authenticated
+using (
+  bucket_id = 'trainer-media'
+  and (storage.foldername(name))[1] = public.current_institution_id()::text
+  and exists (
+    select 1 from public.conversation_members cm
+    where cm.profile_id = auth.uid()
+      and cm.conversation_id::text = (storage.foldername(name))[2]
+  )
+);
+
+-- Restrictive backstops: even if an older permissive policy still exists on the
+-- live project, these cannot be OR-ed away.
+drop policy if exists trainer_medical_scope_restrictive on storage.objects;
+create policy trainer_medical_scope_restrictive on storage.objects as restrictive for select to authenticated
+using (
+  bucket_id <> 'trainer-medical'
+  or (
+    public.is_institution_admin()
+    and (storage.foldername(name))[1] = public.current_institution_id()::text
+  )
+);
+
+drop policy if exists trainer_media_scope_restrictive on storage.objects;
+create policy trainer_media_scope_restrictive on storage.objects as restrictive for select to authenticated
+using (
+  bucket_id <> 'trainer-media'
+  or (
+    (storage.foldername(name))[1] = public.current_institution_id()::text
+    and exists (
+      select 1 from public.conversation_members cm
+      where cm.profile_id = auth.uid()
+        and cm.conversation_id::text = (storage.foldername(name))[2]
+    )
+  )
+);
+
+drop policy if exists trainer_avatars_read on storage.objects;
+create policy trainer_avatars_read on storage.objects for select to authenticated
+using (
+  bucket_id = 'trainer-avatars'
+  and (
+    public.is_platform_owner()
+    or (storage.foldername(name))[1] = public.current_institution_id()::text
+    or (storage.foldername(name))[1] = 'platform'
+  )
+);
+
+drop policy if exists trainer_report_templates_read on storage.objects;
+create policy trainer_report_templates_read on storage.objects for select to authenticated
+using (
+  bucket_id = 'trainer-report-templates'
+  and (storage.foldername(name))[1] = public.current_institution_id()::text
+);
+
+drop policy if exists trainer_report_templates_write on storage.objects;
+create policy trainer_report_templates_write on storage.objects for insert to authenticated
+with check (
+  bucket_id = 'trainer-report-templates'
+  and public.is_institution_admin()
+  and (storage.foldername(name))[1] = public.current_institution_id()::text
+);
+
+-- ============================================================================
+-- SECTION 11 - RLS COVERAGE WITHOUT LOCKOUT (pending approval)
+-- ----------------------------------------------------------------------------
+-- The repository enables RLS on only a few tables. Enabling it on a table that
+-- still has no policy would make the app silently lose access. This block only
+-- enables RLS on public tables that already have at least one policy, so it is
+-- additive and cannot create a lockout by itself.
+
+do $$
+declare
+  r record;
+begin
+  for r in
+    select c.oid::regclass as qualified_name
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'public'
+       and c.relkind = 'r'
+       and not c.relrowsecurity
+       and exists (
+         select 1 from pg_policies p
+          where p.schemaname = 'public' and p.tablename = c.relname
+       )
+  loop
+    execute format('alter table %s enable row level security', r.qualified_name);
+  end loop;
+end;
+$$;
+
+-- ============================================================================
+-- SECTION 12 - COACH CAN NEVER DELETE A REPORT (pending approval)
+-- ----------------------------------------------------------------------------
+-- Permissive delete policies are OR-combined, so an old permissive coach policy
+-- could survive the additions above. A RESTRICTIVE policy is AND-combined and
+-- therefore guarantees that the coach role can never delete a report.
+
+drop policy if exists reports_coach_never_delete on public.daily_reports;
+create policy reports_coach_never_delete on public.daily_reports as restrictive for delete to authenticated
+using (public.current_app_role() is distinct from 'coach');
+
+-- ============================================================================
+-- END OF PENDING CHANGES
+-- Nothing in this file has been executed. Every section requires explicit
+-- production approval. Do not paste this file into the SQL editor as a whole:
+-- review and approve section by section.
+-- ============================================================================
