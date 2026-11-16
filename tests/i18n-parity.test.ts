@@ -80,3 +80,55 @@ test('the report-draft and notification labels added in round 12 exist in all th
   assert.notEqual(dict.ar.close, dict.en.close)
   assert.notEqual(dict.fr.close, dict.en.close)
 })
+
+test('the repair labels for classes, follow-ups, templates and failures exist in all three languages', () => {
+  const added: Key[] = [
+    'class',
+    'addClass',
+    'deleteClass',
+    'noClassesYet',
+    'noDescription',
+    'classUpdateFailed',
+    'classDeleteFailed',
+    'deleted',
+    'archived',
+    'you',
+    'selectCoach',
+    'never',
+    'absences',
+    'absenceReturned',
+    'absenceReturnedShort',
+    'followUpComputedHint',
+    'followUpUpdateFailed',
+    'markFollowUpOpen',
+    'reportSaveFailed',
+    'reportDetailsFailed',
+    'reportDeleteFailed',
+    'reportReviewFailed',
+    'studentSaveFailed',
+    'noteUpdateFailed',
+    'templatePlaceholders',
+    'templateExportHint',
+    'templateUpdateFailed',
+    'templateUploadFailed',
+    'templateExportFailed',
+    'importXlsUnsupported',
+    'institutionDeleteUnavailable',
+    'existingAccountPending',
+    'changeAvatar',
+    'notFoundTitle',
+    'notFoundBody',
+    'backHome',
+  ]
+  for (const key of added) {
+    for (const lang of LANGS) {
+      const value = (dict[lang] as Record<string, string | undefined>)[key]
+      assert.ok(typeof value === 'string' && value.trim().length > 0, `${lang}.${key} is missing`)
+    }
+  }
+  // Failure and navigation labels must be translated, not echoed from English.
+  assert.notEqual(dict.ar.reportSaveFailed, dict.en.reportSaveFailed)
+  assert.notEqual(dict.fr.reportSaveFailed, dict.en.reportSaveFailed)
+  assert.notEqual(dict.ar.notFoundTitle, dict.en.notFoundTitle)
+  assert.notEqual(dict.fr.notFoundTitle, dict.en.notFoundTitle)
+})

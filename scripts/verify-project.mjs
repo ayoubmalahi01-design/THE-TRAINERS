@@ -11,12 +11,23 @@ const required = [
   'src/lib/i18n.ts',
   'src/lib/account-policy.ts',
   'src/lib/account-gate.ts',
+  'src/lib/report-permissions.ts',
+  'src/lib/report-details.ts',
+  'src/lib/absence.ts',
+  'src/lib/report-template.ts',
+  'src/lib/report-template-render.ts',
   'tests/otp-security.test.ts',
   'tests/account-policy.test.ts',
   'tests/account-permissions.test.ts',
+  'tests/report-permissions.test.ts',
+  'tests/report-details.test.ts',
+  'tests/absence.test.ts',
+  'tests/report-template.test.ts',
   'supabase/THE_TRAINERS_SETUP.sql',
+  'SUPABASE_PENDING_CHANGES.sql',
   'supabase/INVITATIONS_OTP_INCREMENTAL.sql',
   'supabase/migrations/0003_account_management_repair.sql',
+  'supabase/migrations/0004_report_templates_details_notifications.sql',
   'supabase/functions/invite-user/index.ts',
   'supabase/functions/verify-otp/index.ts',
   'supabase/functions/send-whatsapp/index.ts',
@@ -125,7 +136,8 @@ const checks = [
   ['direct and group conversation creation', /create_conversation/.test(app) && /conversation_type/.test(app)],
   ['conversation-scoped message reads and writes', /eq\('conversation_id',id\)/.test(app) && /conversation_id:current\.id/.test(app)],
   ['conversation membership enforced for messages', /messages_read_member[\s\S]*?is_conversation_member\(conversation_id\)/i.test(sql) && /messages_insert_member[\s\S]*?is_conversation_member\(conversation_id\)/i.test(sql)],
-  ['private conversation media storage', /trainer_media_read[\s\S]*?is_conversation_member\(m\.conversation_id\)/i.test(sql)],
+  ['private conversation media storage', /trainer_media_read[\s\S]*?conversation_id::text = \(storage\.foldername\(name\)\)\[2\]/i.test(sql)],
+  ['medical storage is admin and institution scoped', /trainer_medical_admin_read[\s\S]*?is_institution_admin\(\)[\s\S]*?current_institution_id\(\)::text/i.test(sql)],
   ['automatic report counts from attendance', /attendance_records[\s\S]*?present_count/.test(app)],
   ['admin report review workflow', /reports_admin_review/.test(sql) && /reviewed_by/.test(app)],
   ['owner and director only can invite', /admin:\s*\[\]/.test(policy) && /coach:\s*\[\]/.test(policy) && /manager:\s*\['admin',\s*'coach'\]/.test(policy)],
@@ -182,6 +194,42 @@ const checks = [
   ['browser never chooses the invitation to redeem', !/invoke\('verify-otp'[\s\S]{0,300}?invitation_id/.test(app)],
   ['role matrix: owner may not invite owners', /owner:\s*\['manager',\s*'admin',\s*'coach'\]/.test(invite) && /manager:\s*\['admin',\s*'coach'\]/.test(invite) && /admin:\s*\[\]/.test(invite) && /coach:\s*\[\]/.test(invite)],
   ['email invitation flow is preserved', /inviteUserByEmail/.test(invite) && /use_otp/.test(invite)],
+
+  // ------------------------------------------------------- repair integrity
+  ['setup creates every table the app queries', [
+    'institutions','profiles','classes','students','student_medical_records','coach_shifts',
+    'daily_reports','report_templates','report_exports','report_details','student_notes',
+    'admin_notices','notifications','coach_notebooks','audit_logs','invitations',
+    'academic_years','student_academic_enrollments','conversations','conversation_members',
+    'messages','message_reads','attendance_records','absence_followups',
+  ].every((table) => new RegExp(`create table if not exists public\\.${table}\\b`, 'i').test(sql))],
+  ['setup has no invalid partial unique constraint', !/constraint\s+\w+\s+unique\s*\([^)]*\)\s*where/i.test(sql)],
+  ['setup dollar-quoted functions are balanced', ((sql.match(/\$\$/g) || []).length % 2) === 0],
+  ['setup enables RLS on core tables', ['daily_reports','report_details','attendance_records','messages','message_reads','notifications','coach_notebooks','audit_logs'].every((table) => new RegExp(`alter table public\\.${table} enable row level security`, 'i').test(sql))],
+  ['report deletion is restricted by role', /reports_delete_manager[\s\S]*?current_app_role\(\) = 'manager'[\s\S]*?reports_delete_admin[\s\S]*?current_app_role\(\) = 'admin'/i.test(sql) && !/create policy [a-z_]*delete[a-z_]* on public\.daily_reports[\s\S]{0,200}?current_app_role\(\) = 'coach'/i.test(sql)],
+  ['report details are written before finalization', (() => {
+    const details = app.indexOf('Step 2 — replace student details')
+    const finalize = app.indexOf('Step 3 — finalize')
+    return details > 0 && finalize > details && app.indexOf('buildReportDetailRows(savedId', details) > details
+  })()],
+  ['vulnerable xlsx dependency is gone', !/from ['"]xlsx['"]/.test(app) && !/"xlsx"\s*:/.test(read('package.json')) && !/xlsx@/.test(read('package-lock.json'))],
+  ['Excel import uses read-excel-file', /read-excel-file\/browser/.test(app)],
+  ['unknown routes render a not-found screen', /path="\*" element=\{<NotFound/.test(app)],
+  ['Word export uses the uploaded template with a fallback', /renderReportTemplate/.test(app) && /buildReportDocument/.test(app)],
+  ['absence queue is computed from attendance', /computeAbsenceFollowUps/.test(app) && /attendance_records/.test(between(app, 'function FollowUpQueue', 'function InstitutionSettings'))],
+  ['read receipts are per message and reader', /message_reads\(message_id, reader_id, read_at\)/i.test(sql) && /primary key \(message_id, reader_id\)/i.test(sql) && /on conflict \(message_id, reader_id\)/i.test(sql)],
+  ['institution deletion is not called from the browser', !/rpc\('delete_institution'/.test(app) && /institutionDeleteUnavailable/.test(app)],
+  ['pending production SQL stays approval-gated', /SECTION 12/.test(read('SUPABASE_PENDING_CHANGES.sql')) && /requires\s+explicit[\s\S]{0,40}?production\s+approval/i.test(read('SUPABASE_PENDING_CHANGES.sql'))],
+  ['web manifest carries valid Arabic metadata and icons', (() => {
+    try {
+      const manifest = JSON.parse(read('public/manifest.webmanifest'))
+      return manifest.short_name === 'تدريب'
+        && /[\u0600-\u06FF]/.test(manifest.description)
+        && Array.isArray(manifest.icons) && manifest.icons.length >= 2
+        && !/\uFFFD/.test(read('public/manifest.webmanifest'))
+    } catch { return false }
+  })()],
+  ['page title and description are readable', /<title>The Trainers — تدريب<\/title>/.test(read('index.html')) && /[\u0600-\u06FF]/.test(read('index.html')) && !/\uFFFD/.test(read('index.html'))],
 
   // ----------------------------------------------------------- secret hygiene
   ['no service-role key in frontend', !/SUPABASE_SERVICE_ROLE_KEY|service_role_key|serviceRoleKey/.test(app) && !/SUPABASE_SERVICE_ROLE_KEY|service_role_key|serviceRoleKey/.test(read('src/lib/supabase.ts'))],
