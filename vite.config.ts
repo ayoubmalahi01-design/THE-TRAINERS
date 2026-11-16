@@ -1,8 +1,17 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import path from 'node:path'
 
 export default defineConfig({
   plugins: [react()],
+  resolve: {
+    alias: {
+      xlsx: path.resolve(__dirname, 'node_modules/xlsx/xlsx.js'),
+    },
+  },
+  optimizeDeps: {
+    include: ['xlsx'],
+  },
   build: {
     sourcemap: false,
     // F12: one 470 kB entry chunk delayed first paint on phones and made every
